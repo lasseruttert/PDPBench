@@ -1,0 +1,12 @@
+name: PDPBench
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - numpy
+    - pyparsing
+    - pandas
+    - kaggle-benchmarks
+    - kaggle
