@@ -123,6 +123,99 @@ def score_feasibility(problem, solution):
     return 1.0 if is_feasible(problem, solution) else 0.0
 
 
+def count_violations(problem, solution):
+    """Walk a solution without short-circuiting and count each type of constraint violation.
+
+    Mirrors the checks in utils.feasibility.is_feasible but keeps going so we can see
+    what the LLM did wrong. Returns a dict mapping violation type -> count.
+    """
+    counts = {
+        "not_start_at_depot": 0,
+        "not_end_at_depot": 0,
+        "depot_in_middle": 0,
+        "duplicate_node": 0,
+        "delivery_before_pickup": 0,
+        "invalid_node": 0,
+        "capacity": 0,
+        "time_window": 0,
+        "missing_nodes": 0,
+        "extra_vehicles": 0,
+    }
+    pickup_to_delivery = problem.pickup_to_delivery
+    delivery_to_pickup = problem.delivery_to_pickup
+    demands = problem.demands
+    vehicle_capacity = problem.vehicle_capacity
+    distance_matrix = problem.distance_matrix
+    time_windows = problem.time_windows
+    service_times = problem.service_times
+    n_nodes = len(problem.nodes)
+
+    seen_total = set()
+    non_empty_routes = 0
+    for route in solution.routes:
+        if not route or len(route) < 2:
+            continue
+        non_empty_routes += 1
+
+        if route[0] != 0:
+            counts["not_start_at_depot"] += 1
+        if route[-1] != 0:
+            counts["not_end_at_depot"] += 1
+
+        load = 0
+        current_time = 0
+        seen = set()
+        for i in range(len(route) - 1):
+            from_node = route[i]
+            to_node = route[i + 1]
+
+            if 0 < i + 1 < len(route) - 1 and to_node == 0:
+                counts["depot_in_middle"] += 1
+
+            if to_node in seen:
+                counts["duplicate_node"] += 1
+
+            is_valid_node = to_node == 0 or to_node in pickup_to_delivery or to_node in delivery_to_pickup
+            if not is_valid_node:
+                counts["invalid_node"] += 1
+            elif to_node in delivery_to_pickup and delivery_to_pickup[to_node] not in seen:
+                counts["delivery_before_pickup"] += 1
+
+            if 0 <= to_node < n_nodes:
+                load += int(demands[to_node])
+                if load < 0 or load > vehicle_capacity:
+                    counts["capacity"] += 1
+
+                if 0 <= from_node < n_nodes:
+                    current_time += float(distance_matrix[from_node, to_node])
+                tw_start, tw_end = time_windows[to_node]
+                if current_time < tw_start:
+                    current_time = float(tw_start)
+                if current_time > tw_end:
+                    counts["time_window"] += 1
+                current_time += float(service_times[to_node])
+
+            seen.add(to_node)
+
+        seen_total.update(seen)
+
+    all_idx = set(node.index for node in problem.nodes)
+    counts["missing_nodes"] = len(all_idx - seen_total)
+
+    if non_empty_routes > problem.num_vehicles:
+        counts["extra_vehicles"] = non_empty_routes - problem.num_vehicles
+
+    return counts
+
+
+def format_violations(counts):
+    """Format non-zero violations as a compact string, or 'none' if all zero."""
+    active = [(k, v) for k, v in counts.items() if v > 0]
+    if not active:
+        return "none"
+    return ", ".join(f"{k}={v}" for k, v in active)
+
+
 def score_distance_gap(actual_distance, bks_distance):
     if bks_distance <= 0:
         return 0.0
@@ -158,47 +251,108 @@ def llm_prompt(llm, prompt, retries=3, delay=10):
 # JSON response parsing (with regex fallback)
 # =============================================================================
 
+def _extract_balanced_json_object(text):
+    """Scan text for the first balanced {...} block, respecting string literals.
+
+    Returns the substring or None. Handles nested braces and ignores braces inside
+    double-quoted strings (with backslash escapes).
+    """
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_str = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:i + 1]
+        start = text.find("{", start + 1)
+    return None
+
+
+def _tolerant_json_loads(s):
+    """Try json.loads with light cleanup: trailing commas, // comments, single quotes."""
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    # Strip // line comments
+    cleaned = re.sub(r"//[^\n]*", "", s)
+    # Strip trailing commas before } or ]
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    # Last resort: swap single quotes for double quotes (only if no double quotes used for keys)
+    if '"' not in cleaned:
+        swapped = cleaned.replace("'", '"')
+        try:
+            return json.loads(swapped)
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 def parse_json_response(raw):
-    """Parse JSON from LLM response. Tries code block extraction, then raw parse, then regex."""
+    """Parse JSON from LLM response.
+
+    Strategy (each layer returns on success):
+      1. Strip <think>/<thinking> blocks
+      2. Fenced code block ```json ... ```
+      3. Whole-text json.loads
+      4. Balanced-brace scan + tolerant cleanup
+      5. Routes-only regex
+      6. \\boxed{} / "answer is X" / "distance is X"
+      7. Ultimate fallback: last number in text -> _fallback_number
+    """
     if not raw:
         return {}
     text = str(raw)
-    # Try extracting from code block
-    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            pass
-    # Try parsing the whole text as JSON
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # Try finding a JSON object in the text
-    brace_match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
-    if brace_match:
-        try:
-            return json.loads(brace_match.group(0))
-        except json.JSONDecodeError:
-            pass
-    # Try finding a large JSON object (with nested braces for routes)
-    deep_match = re.search(r"\{.*\}", text, re.DOTALL)
-    if deep_match:
-        try:
-            return json.loads(deep_match.group(0))
-        except json.JSONDecodeError:
-            pass
-    # Fallback: extract values from plain text responses (e.g. LaTeX \boxed{}, "the answer is X")
-    # Try to extract a single integer (for predicted_node)
-    boxed = re.search(r"\\boxed\{\\text\{(\d+)\}\}", text) or re.search(r"\\boxed\{(\d+)\}", text)
-    if boxed:
-        return {"_fallback_number": int(boxed.group(1))}
-    # "the answer is 42", "answer: 42", "predicted node is 42"
-    answer_match = re.search(r"(?:answer|predicted[_ ]node|node)\s*(?:is|:|=)\s*(\d+)", text, re.IGNORECASE)
-    if answer_match:
-        return {"_fallback_number": int(answer_match.group(1))}
-    # Try to extract routes from plain text like [[0,1,2,0],[0,3,4,0]]
+
+    # 1. Strip thinking/reasoning tags
+    text = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text, flags=re.DOTALL | re.IGNORECASE)
+
+    # 2. Try extracting from fenced code block
+    for m in re.finditer(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL):
+        block = m.group(1).strip()
+        parsed = _tolerant_json_loads(block)
+        if parsed is not None:
+            return parsed
+        # The block itself may contain prose around a JSON object
+        inner = _extract_balanced_json_object(block)
+        if inner:
+            parsed = _tolerant_json_loads(inner)
+            if parsed is not None:
+                return parsed
+
+    # 3. Try parsing the whole text as JSON
+    parsed = _tolerant_json_loads(text.strip())
+    if parsed is not None:
+        return parsed
+
+    # 4. Balanced-brace scan for the first full JSON object in the text
+    candidate = _extract_balanced_json_object(text)
+    if candidate:
+        parsed = _tolerant_json_loads(candidate)
+        if parsed is not None:
+            return parsed
+
+    # 5. Try to extract routes from plain text like [[0,1,2,0],[0,3,4,0]]
     routes_match = re.search(r"\[\s*\[[\d,\s\[\]]+\]\s*\]", text)
     if routes_match:
         try:
@@ -207,10 +361,29 @@ def parse_json_response(raw):
                 return {"routes": routes}
         except json.JSONDecodeError:
             pass
-    # Try to extract a float (for predicted_distance)
-    dist_match = re.search(r"(?:distance|total)\s*(?:is|:|=)\s*([\d.]+)", text, re.IGNORECASE)
+
+    # 6. LaTeX \boxed{} / "the answer is X" / "distance is X"
+    boxed = re.search(r"\\boxed\{\\text\{(-?\d+\.?\d*)\}\}", text) or re.search(r"\\boxed\{(-?\d+\.?\d*)\}", text)
+    if boxed:
+        val = boxed.group(1)
+        return {"_fallback_number": float(val) if "." in val else int(val)}
+    answer_match = re.search(r"(?:answer|predicted[_ ]node|node)\s*(?:is|:|=)\s*(-?\d+)", text, re.IGNORECASE)
+    if answer_match:
+        return {"_fallback_number": int(answer_match.group(1))}
+    dist_match = re.search(r"(?:distance|total)\s*(?:is|:|=)\s*(-?\d+\.?\d*)", text, re.IGNORECASE)
     if dist_match:
         return {"_fallback_number": float(dist_match.group(1))}
+
+    # 7. Ultimate fallback: take the last number anywhere in the text
+    numbers = re.findall(r"-?\d+\.?\d*", text)
+    numbers = [n for n in numbers if n not in ("", "-", ".", "-.")]
+    if numbers:
+        last = numbers[-1]
+        try:
+            return {"_fallback_number": float(last) if "." in last else int(last)}
+        except ValueError:
+            pass
+
     return {}
 
 
@@ -331,15 +504,31 @@ def build_distance_prediction_prompt(problem, solution, distance_mode):
     return _format_prompt(problem, distance_mode, instructions, extra_data={"Solution": sol_data})
 
 
-def build_route_completion_prompt(problem, partial_solution, incomplete_route_idx, remaining_nodes, distance_mode):
+def build_route_completion_prompt(problem, partial_solution, removed_requests, distance_mode):
     sol_data = build_solution_json(partial_solution, include_distance=False)
+    requests_info = []
+    for pickup_idx, delivery_idx in removed_requests:
+        pn = problem.nodes_dict[pickup_idx]
+        dn = problem.nodes_dict[delivery_idx]
+        requests_info.append({
+            "pickup": {"index": pickup_idx, "demand": pn.demand, "time_window": list(pn.time_window), "service_time": pn.service_time},
+            "delivery": {"index": delivery_idx, "demand": dn.demand, "time_window": list(dn.time_window), "service_time": dn.service_time},
+        })
     instructions = (
-        f"Route {incomplete_route_idx} is incomplete — it has been truncated and does not return to the depot yet.\n\n"
-        f"The following nodes still need to be visited on this route: {remaining_nodes}\n\n"
-        "Complete the route by determining the correct order for the remaining nodes, "
-        "then return to depot (0). The completed route must satisfy all PDPTW constraints.\n\n"
-        'Respond with EXACTLY this JSON:\n{"completed_route": [0, ...node ids..., 0], "reasoning": "your reasoning"}')
-    return _format_prompt(problem, distance_mode, instructions, extra_data={"Partial Solution": sol_data})
+        "One route has been removed from the solution. The partial solution below contains every other route unchanged, "
+        f"and the {len(removed_requests)} requests listed below were all served by the removed route.\n\n"
+        "Construct a single NEW route (one vehicle) that serves ALL of the listed requests. "
+        "The other routes must stay exactly as shown.\n\n"
+        "Requirements:\n"
+        "- The new route must start and end at the depot (0).\n"
+        "- Every pickup and its paired delivery from the request list must appear exactly once in the new route.\n"
+        "- Each pickup must appear before its paired delivery.\n"
+        "- Capacity and time window constraints must be satisfied for this single vehicle.\n"
+        "- Minimize the travel distance of the new route.\n\n"
+        'Respond with EXACTLY this JSON:\n{"new_route": [0, ...node ids..., 0], "reasoning": "your reasoning"}')
+    return _format_prompt(problem, distance_mode, instructions,
+                          extra_data={"Partial Solution (one route removed)": sol_data,
+                                      "Requests served by the removed route": requests_info})
 
 
 def build_full_solution_prompt(problem, distance_mode):
@@ -420,7 +609,7 @@ if HAS_KBENCH:
     err% = |predicted - actual| / actual
     score = max(0, 1 - err%)
 
-  Task 4 (Route Completion):  complete a truncated route
+  Task 4 (Route Completion):  reconstruct a missing route from its request list
     FEASIBLE/INFEASIBLE + distance gap vs BKS
     score = 0.5*feasibility + 0.5*distance_gap
 
@@ -472,11 +661,8 @@ if HAS_KBENCH:
             ok = "EXACT" if score == 1.0 else ("FEASIBLE" if score == 0.5 else "WRONG")
             if "_fallback_number" in data:
                 parse_ok = "boxed_fallback"
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | JSON parse failed, extracted from boxed/text: {data['_fallback_number']}")
             elif not data:
                 parse_ok = "json_fail"
-                raw_str = str(raw)
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | JSON PARSE FAILED | first 500 chars:\n    {raw_str[:500]}\n    ...last 500 chars:\n    {raw_str[-500:]}")
             else:
                 parse_ok = "json_ok"
             print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | predicted={predicted} correct={correct_node} | {ok} | {parse_ok} | score={score}")
@@ -516,16 +702,16 @@ if HAS_KBENCH:
             if solution is None:
                 score = 0.0
                 d.update(result="PARSE_FAIL", score=0.0)
-                raw_str = str(raw)
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | PARSE_FAIL | first 500 chars:\n    {raw_str[:500]}\n    ...last 500 chars:\n    {raw_str[-500:]}")
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | PARSE_FAIL | score=0.0")
             else:
                 feasible = score_feasibility(problem, solution)
                 d["llm_dist"] = round(solution.total_distance, 1)
                 d["feasible"] = feasible == 1.0
                 if feasible == 0.0:
                     score = 0.0
-                    d.update(result="INFEASIBLE", score=0.0)
-                    print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | INFEASIBLE | llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} | score=0.0")
+                    violations = count_violations(problem, solution)
+                    d.update(result="INFEASIBLE", score=0.0, violations=violations)
+                    print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | INFEASIBLE | llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} | violations: {format_violations(violations)} | score=0.0")
                 else:
                     dist_score = score_distance_gap(solution.total_distance, bks.total_distance)
                     score = 0.5 * feasible + 0.5 * dist_score
@@ -562,12 +748,6 @@ if HAS_KBENCH:
             except (ValueError, TypeError):
                 predicted = 0.0
 
-            if "_fallback_number" in data:
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | JSON parse failed, extracted from boxed/text: {data['_fallback_number']}")
-            elif not data:
-                raw_str = str(raw)
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | JSON PARSE FAILED | first 500 chars:\n    {raw_str[:500]}\n    ...last 500 chars:\n    {raw_str[-500:]}")
-
             actual = bks.total_distance
             score = score_distance_prediction(predicted, actual)
             scores.append(score)
@@ -588,70 +768,68 @@ if HAS_KBENCH:
 
     @kbench.task(name="pdptw_route_completion")
     def pdptw_route_completion(llm) -> float:
-        """Complete a truncated route in a PDPTW solution."""
+        """Reconstruct a missing route: BKS with one full route removed + its request list."""
         scores = []
         details = []
         start = time.time()
         for i, (problem, bks) in enumerate(INSTANCES):
+            # Remove the longest BKS route entirely and extract its requests
             longest_idx = max(range(len(bks.routes)), key=lambda r: len(bks.routes[r]))
-            route = bks.routes[longest_idx]
-            customer_nodes = route[1:-1]
-            midpoint = len(customer_nodes) // 2
-            kept = customer_nodes[:midpoint]
-            remaining = customer_nodes[midpoint:]
-            partial_routes = [r[:] for r in bks.routes]
-            partial_routes[longest_idx] = [0] + kept
+            removed_route = bks.routes[longest_idx]
+            removed_customers = set(removed_route[1:-1])
+            removed_requests = [(p, d) for p, d in problem.pickups_deliveries if p in removed_customers]
+            partial_routes = [r[:] for idx, r in enumerate(bks.routes) if idx != longest_idx]
             partial = PDPTWSolution(problem=problem, routes=partial_routes)
-            prompt = build_route_completion_prompt(problem, partial, longest_idx, remaining, DISTANCE_MODE)
+
+            prompt = build_route_completion_prompt(problem, partial, removed_requests, DISTANCE_MODE)
             raw = llm_prompt(llm, prompt)
             data = parse_json_response(raw)
-            d = {"instance": problem.name, "kept": len(kept), "remaining": len(remaining), "bks_dist": round(bks.total_distance, 1)}
+            d = {"instance": problem.name, "removed_route_len": len(removed_route), "n_requests": len(removed_requests), "bks_dist": round(bks.total_distance, 1)}
 
-            completed_route = data.get("completed_route", None)
-            # Fallback: if routes were extracted but not completed_route, use the first route
-            if completed_route is None and "routes" in data and isinstance(data["routes"], list) and data["routes"]:
-                completed_route = data["routes"][0] if len(data["routes"]) == 1 else data["routes"][longest_idx] if longest_idx < len(data["routes"]) else data["routes"][0]
-            if not isinstance(completed_route, list):
+            new_route = data.get("new_route", data.get("completed_route", None))
+            # Fallback: LLM returned a 'routes' list — take the first
+            if new_route is None and "routes" in data and isinstance(data["routes"], list) and data["routes"]:
+                new_route = data["routes"][0]
+            if not isinstance(new_route, list):
                 scores.append(0.0)
                 details.append({**d, "result": "PARSE_FAIL", "score": 0.0})
-                raw_str = str(raw)
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | kept={len(kept)} remaining={len(remaining)} | PARSE_FAIL | first 500 chars:\n    {raw_str[:500]}\n    ...last 500 chars:\n    {raw_str[-500:]}")
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | PARSE_FAIL | score=0.0")
                 continue
 
             try:
-                completed_route = [int(n) for n in completed_route]
+                new_route = [int(n) for n in new_route]
             except (ValueError, TypeError):
                 scores.append(0.0)
                 details.append({**d, "result": "PARSE_FAIL", "score": 0.0})
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | kept={len(kept)} remaining={len(remaining)} | PARSE_FAIL | score=0.0")
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | PARSE_FAIL | score=0.0")
                 continue
 
-            if completed_route and completed_route[0] != 0:
-                completed_route.insert(0, 0)
-            if completed_route and completed_route[-1] != 0:
-                completed_route.append(0)
+            if new_route and new_route[0] != 0:
+                new_route.insert(0, 0)
+            if new_route and new_route[-1] != 0:
+                new_route.append(0)
 
-            full_routes = [r[:] for r in partial.routes]
-            full_routes[longest_idx] = completed_route
+            full_routes = [r[:] for r in partial.routes] + [new_route]
             solution = build_solution_from_llm_output(problem, full_routes)
 
             if solution is None:
                 score = 0.0
                 details.append({**d, "result": "BUILD_FAIL", "score": 0.0})
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | kept={len(kept)} remaining={len(remaining)} | BUILD_FAIL | score=0.0")
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | BUILD_FAIL | score=0.0")
             else:
                 feasible = score_feasibility(problem, solution)
                 d["llm_dist"] = round(solution.total_distance, 1)
                 d["feasible"] = feasible == 1.0
                 if feasible == 0.0:
                     score = 0.0
-                    details.append({**d, "result": "INFEASIBLE", "score": 0.0})
-                    print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | kept={len(kept)} remaining={len(remaining)} | INFEASIBLE | llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} | score=0.0")
+                    violations = count_violations(problem, solution)
+                    details.append({**d, "result": "INFEASIBLE", "score": 0.0, "violations": violations})
+                    print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | INFEASIBLE | llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} | violations: {format_violations(violations)} | score=0.0")
                 else:
                     dist_score = score_distance_gap(solution.total_distance, bks.total_distance)
                     score = 0.5 * feasible + 0.5 * dist_score
                     details.append({**d, "result": "FEASIBLE", "dist_gap": round(dist_score, 3), "score": round(score, 3)})
-                    print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | kept={len(kept)} remaining={len(remaining)} | FEASIBLE | llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={dist_score:.3f} | score={score:.3f}")
+                    print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | FEASIBLE | llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={dist_score:.3f} | score={score:.3f}")
 
             scores.append(score)
 
@@ -684,8 +862,7 @@ if HAS_KBENCH:
             if solution is None:
                 score = 0.0
                 details.append({**d, "result": "PARSE_FAIL", "score": 0.0})
-                raw_str = str(raw)
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} vehicles={problem.num_vehicles} | PARSE_FAIL | first 500 chars:\n    {raw_str[:500]}\n    ...last 500 chars:\n    {raw_str[-500:]}")
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} vehicles={problem.num_vehicles} | PARSE_FAIL | score=0.0")
             else:
                 feasible = score_feasibility(problem, solution)
                 n_served = sum(len(r) - 2 for r in solution.routes if len(r) > 2)
@@ -693,8 +870,9 @@ if HAS_KBENCH:
                 d.update(llm_dist=round(solution.total_distance, 1), feasible=feasible == 1.0, served=n_served, expected=n_expected, routes=len(solution.routes))
                 if feasible == 0.0:
                     score = 0.0
-                    details.append({**d, "result": "INFEASIBLE", "score": 0.0})
-                    print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} | INFEASIBLE | llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} served={n_served}/{n_expected} routes={len(solution.routes)} | score=0.0")
+                    violations = count_violations(problem, solution)
+                    details.append({**d, "result": "INFEASIBLE", "score": 0.0, "violations": violations})
+                    print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} | INFEASIBLE | llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} served={n_served}/{n_expected} routes={len(solution.routes)} | violations: {format_violations(violations)} | score=0.0")
                 else:
                     dist_score = score_distance_gap(solution.total_distance, bks.total_distance)
                     score = 0.5 * feasible + 0.5 * dist_score
