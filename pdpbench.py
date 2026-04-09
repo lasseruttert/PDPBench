@@ -31,7 +31,7 @@ except (RuntimeError, ImportError):
 print(f"kbench available: {HAS_KBENCH}")
 
 # =============================================================================
-# Path setup
+# Path setup & logging
 # =============================================================================
 
 KAGGLE = os.path.exists("/kaggle")
@@ -41,7 +41,6 @@ if KAGGLE:
         "/kaggle/input/datasets/lasseruttert/pdpbench-data",
     ]
     BASE_DIR = next((p for p in _CANDIDATES if os.path.exists(p)), _CANDIDATES[0])
-    print(f"Kaggle dataset path: {BASE_DIR}")
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -50,6 +49,27 @@ if BASE_DIR not in sys.path:
 
 DATA_DIR = os.path.join(BASE_DIR, "data")
 BKS_DIR = os.path.join(BASE_DIR, "bks")
+
+# Tee stdout/stderr to a log file
+LOG_PATH = "/kaggle/working/pdpbench_log.txt" if KAGGLE else os.path.join(BASE_DIR, "pdpbench_log.txt")
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+_log_file = open(LOG_PATH, "w", encoding="utf-8")
+sys.stdout = _Tee(sys.__stdout__, _log_file)
+sys.stderr = _Tee(sys.__stderr__, _log_file)
+
+if KAGGLE:
+    print(f"Kaggle dataset path: {BASE_DIR}")
 
 
 # =============================================================================
@@ -169,6 +189,28 @@ def parse_json_response(raw):
             return json.loads(deep_match.group(0))
         except json.JSONDecodeError:
             pass
+    # Fallback: extract values from plain text responses (e.g. LaTeX \boxed{}, "the answer is X")
+    # Try to extract a single integer (for predicted_node)
+    boxed = re.search(r"\\boxed\{\\text\{(\d+)\}\}", text) or re.search(r"\\boxed\{(\d+)\}", text)
+    if boxed:
+        return {"_fallback_number": int(boxed.group(1))}
+    # "the answer is 42", "answer: 42", "predicted node is 42"
+    answer_match = re.search(r"(?:answer|predicted[_ ]node|node)\s*(?:is|:|=)\s*(\d+)", text, re.IGNORECASE)
+    if answer_match:
+        return {"_fallback_number": int(answer_match.group(1))}
+    # Try to extract routes from plain text like [[0,1,2,0],[0,3,4,0]]
+    routes_match = re.search(r"\[\s*\[[\d,\s\[\]]+\]\s*\]", text)
+    if routes_match:
+        try:
+            routes = json.loads(routes_match.group(0))
+            if isinstance(routes, list) and all(isinstance(r, list) for r in routes):
+                return {"routes": routes}
+        except json.JSONDecodeError:
+            pass
+    # Try to extract a float (for predicted_distance)
+    dist_match = re.search(r"(?:distance|total)\s*(?:is|:|=)\s*([\d.]+)", text, re.IGNORECASE)
+    if dist_match:
+        return {"_fallback_number": float(dist_match.group(1))}
     return {}
 
 
@@ -411,7 +453,7 @@ if HAS_KBENCH:
             data = parse_json_response(raw)
 
             try:
-                predicted = int(data.get("predicted_node", -1))
+                predicted = int(data.get("predicted_node", data.get("_fallback_number", -1)))
             except (ValueError, TypeError):
                 predicted = -1
 
@@ -428,7 +470,15 @@ if HAS_KBENCH:
 
             scores.append(score)
             ok = "EXACT" if score == 1.0 else ("FEASIBLE" if score == 0.5 else "WRONG")
-            parse_ok = "json_ok" if data else "json_fail"
+            if "_fallback_number" in data:
+                parse_ok = "boxed_fallback"
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | JSON parse failed, extracted from boxed/text: {data['_fallback_number']}")
+            elif not data:
+                parse_ok = "json_fail"
+                raw_str = str(raw)
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | JSON PARSE FAILED | first 500 chars:\n    {raw_str[:500]}\n    ...last 500 chars:\n    {raw_str[-500:]}")
+            else:
+                parse_ok = "json_ok"
             print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | predicted={predicted} correct={correct_node} | {ok} | {parse_ok} | score={score}")
             details.append({"instance": problem.name, "predicted": predicted, "correct": correct_node, "result": ok, "parse": parse_ok, "score": score})
 
@@ -466,7 +516,8 @@ if HAS_KBENCH:
             if solution is None:
                 score = 0.0
                 d.update(result="PARSE_FAIL", score=0.0)
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | PARSE_FAIL | score=0.0")
+                raw_str = str(raw)
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | PARSE_FAIL | first 500 chars:\n    {raw_str[:500]}\n    ...last 500 chars:\n    {raw_str[-500:]}")
             else:
                 feasible = score_feasibility(problem, solution)
                 d["llm_dist"] = round(solution.total_distance, 1)
@@ -507,9 +558,15 @@ if HAS_KBENCH:
             data = parse_json_response(raw)
 
             try:
-                predicted = float(data.get("predicted_distance", 0))
+                predicted = float(data.get("predicted_distance", data.get("_fallback_number", 0)))
             except (ValueError, TypeError):
                 predicted = 0.0
+
+            if "_fallback_number" in data:
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | JSON parse failed, extracted from boxed/text: {data['_fallback_number']}")
+            elif not data:
+                raw_str = str(raw)
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | JSON PARSE FAILED | first 500 chars:\n    {raw_str[:500]}\n    ...last 500 chars:\n    {raw_str[-500:]}")
 
             actual = bks.total_distance
             score = score_distance_prediction(predicted, actual)
@@ -551,10 +608,14 @@ if HAS_KBENCH:
             d = {"instance": problem.name, "kept": len(kept), "remaining": len(remaining), "bks_dist": round(bks.total_distance, 1)}
 
             completed_route = data.get("completed_route", None)
+            # Fallback: if routes were extracted but not completed_route, use the first route
+            if completed_route is None and "routes" in data and isinstance(data["routes"], list) and data["routes"]:
+                completed_route = data["routes"][0] if len(data["routes"]) == 1 else data["routes"][longest_idx] if longest_idx < len(data["routes"]) else data["routes"][0]
             if not isinstance(completed_route, list):
                 scores.append(0.0)
                 details.append({**d, "result": "PARSE_FAIL", "score": 0.0})
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | kept={len(kept)} remaining={len(remaining)} | PARSE_FAIL | score=0.0")
+                raw_str = str(raw)
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | kept={len(kept)} remaining={len(remaining)} | PARSE_FAIL | first 500 chars:\n    {raw_str[:500]}\n    ...last 500 chars:\n    {raw_str[-500:]}")
                 continue
 
             try:
@@ -623,7 +684,8 @@ if HAS_KBENCH:
             if solution is None:
                 score = 0.0
                 details.append({**d, "result": "PARSE_FAIL", "score": 0.0})
-                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} vehicles={problem.num_vehicles} | PARSE_FAIL | score=0.0")
+                raw_str = str(raw)
+                print(f"  [{i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} vehicles={problem.num_vehicles} | PARSE_FAIL | first 500 chars:\n    {raw_str[:500]}\n    ...last 500 chars:\n    {raw_str[-500:]}")
             else:
                 feasible = score_feasibility(problem, solution)
                 n_served = sum(len(r) - 2 for r in solution.routes if len(r) > 2)
