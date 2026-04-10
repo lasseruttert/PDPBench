@@ -1,3 +1,6 @@
 */__pycache__/
 */*/__pycache__/
 .claude/
+__pycache__/
+kaggle_dataset/
+CLAUDE.md

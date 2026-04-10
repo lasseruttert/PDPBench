@@ -1,20 +1,17 @@
-"""
-PDPBench: LLM Benchmark for Pickup and Delivery Problems with Time Windows
-===========================================================================
-Tests LLM understanding of PDPTW across three construction tasks of increasing
-difficulty, each run in three modalities (one-shot, iterative, tool-use) for
-9 tasks total:
-  - Request Insertion  (easy)
-  - Route Completion   (medium)
-  - Full Solution      (hard)
+"""PDPBench shared library — imported by all per-task files.
 
-Tracks: Executive Functions & Attention (Combinatorial Optimization)
-"""
+Contains all scoring functions, the JSON parser, prompt builders, and
+instance loading utilities. Each per-task file does:
 
-import subprocess, sys
-subprocess.run([sys.executable, "-m", "pip", "install", "kaggle-benchmarks", "pyparsing", "-q"], check=True)
+    from pdpbench_lib import *
+
+This lib is self-locating: BASE_DIR resolves to the directory containing
+this file (the dataset root on Kaggle, the project root locally), which
+must be co-located with utils/ and the data/ and bks/ directories.
+"""
 
 import os
+import sys
 import ast
 import json
 import re
@@ -22,59 +19,21 @@ import time
 import numpy as np
 from enum import Enum
 
-try:
-    import kaggle_benchmarks as kbench
-    HAS_KBENCH = hasattr(kbench, "llm")
-except (RuntimeError, ImportError):
-    kbench = None
-    HAS_KBENCH = False
-
-print(f"kbench available: {HAS_KBENCH}")
 
 # =============================================================================
-# Path setup & logging
+# Paths (self-locating — always points to dataset root)
 # =============================================================================
 
-KAGGLE = os.path.exists("/kaggle")
-if KAGGLE:
-    _CANDIDATES = [
-        "/kaggle/input/pdpbench-data",
-        "/kaggle/input/datasets/lasseruttert/pdpbench-data",
-    ]
-    BASE_DIR = next((p for p in _CANDIDATES if os.path.exists(p)), _CANDIDATES[0])
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+BKS_DIR = os.path.join(BASE_DIR, "bks")
 
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-DATA_DIR = os.path.join(BASE_DIR, "data")
-BKS_DIR = os.path.join(BASE_DIR, "bks")
-
-# Tee stdout/stderr to a log file
-LOG_PATH = "/kaggle/working/pdpbench_log.txt" if KAGGLE else os.path.join(BASE_DIR, "pdpbench_log.txt")
-
-class _Tee:
-    def __init__(self, *streams):
-        self.streams = streams
-    def write(self, data):
-        for s in self.streams:
-            s.write(data)
-            s.flush()
-    def flush(self):
-        for s in self.streams:
-            s.flush()
-
-_log_file = open(LOG_PATH, "w", encoding="utf-8")
-sys.stdout = _Tee(sys.__stdout__, _log_file)
-sys.stderr = _Tee(sys.__stderr__, _log_file)
-
-if KAGGLE:
-    print(f"Kaggle dataset path: {BASE_DIR}")
-
 
 # =============================================================================
-# Imports from utils (in dataset)
+# Utils imports (from dataset root/utils/)
 # =============================================================================
 
 from utils.pdptw_problem import PDPTWProblem, Node, Request
@@ -84,6 +43,22 @@ from utils.li_lim_instance_manager import LiLimInstanceManager
 from utils.mendeley_instance_manager import MendeleyInstanceManager
 from utils.best_known_solutions import BestKnownSolutions
 from utils.feasibility import is_feasible
+
+
+# =============================================================================
+# Logging helper (Tee — no leading underscore so import * exports it)
+# =============================================================================
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+    def flush(self):
+        for s in self.streams:
+            s.flush()
 
 
 # =============================================================================
@@ -293,11 +268,10 @@ def format_violations(counts):
     return ", ".join(f"{k}={v}" for k, v in active)
 
 
-def print_task_header(task_id, title, n_instances, distance_mode_str=None):
-    dm = distance_mode_str or DISTANCE_MODE.value
+def print_task_header(task_id, title, n_instances, distance_mode_str="auto"):
     print(f"\n{'='*60}")
     print(f"  TASK {task_id} : {title}")
-    print(f"  Running {n_instances} instances in {dm} distance mode")
+    print(f"  Running {n_instances} instances in {distance_mode_str} distance mode")
     print(f"{'='*60}")
 
 
@@ -426,6 +400,7 @@ def llm_prompt(llm, prompt, retries=4, delay=30):
 #     - new_route: completed_route, route, added_route, reconstructed_route
 #     - top-level bare list auto-wrapped by inferred shape
 #     - nested answer/result/output/response promoted to top level
+#     - dict-of-routes: {"vehicle_0": [0,...,0], "vehicle_1": [0,...,0]} pattern
 #
 #   Prose fallbacks (when nothing structured can be extracted):
 #     - "Insert X before/after Y" natural language for insertion ops
@@ -767,6 +742,19 @@ def _normalize_parsed(data):
             k = _find_alias(result, (canonical,))
             if k is not None and k != canonical:
                 result[canonical] = result[k]
+
+    # Dict-of-routes fallback: {"vehicle_0": [0,1,2,0], "vehicle_1": [0,3,4,0]}
+    # or {"route 1": [0,...,0], "route 2": [0,...,0]}.
+    # Fires only when no canonical key was resolved AND every dict value is a
+    # route-shaped list (list of at least 2 numbers). The guard
+    # `len(candidate_routes) == len(result)` prevents false positives when the
+    # dict mixes route-lists with scalars (e.g. "total_distance": 123.4).
+    if "routes" not in result and "insertions" not in result and "new_route" not in result:
+        def _is_route_list(v):
+            return isinstance(v, list) and len(v) >= 2 and all(isinstance(n, (int, float)) for n in v)
+        candidate_routes = [v for v in result.values() if _is_route_list(v)]
+        if candidate_routes and len(candidate_routes) == len(result):
+            result["routes"] = candidate_routes
 
     return result
 
@@ -1226,6 +1214,7 @@ def iterative_distance_mode(problem):
 
 
 def get_benchmark_instances():
+    """Load all benchmark instances. Uses DATA_DIR and BKS_DIR from this lib's BASE_DIR."""
     li_lim_mgr = LiLimInstanceManager(base_dir=DATA_DIR)
     mendeley_mgr = MendeleyInstanceManager(base_dir=DATA_DIR)
     bks = BestKnownSolutions(bks_path=BKS_DIR)
@@ -1241,630 +1230,8 @@ def get_benchmark_instances():
     return instances
 
 
-INSTANCES = get_benchmark_instances()
-print(f"Loaded {len(INSTANCES)} instances")
-
-
-# =============================================================================
-# Identify model + print metric legend
-# =============================================================================
-
-RESULTS_PATH = "/kaggle/working/results.json" if KAGGLE else os.path.join(BASE_DIR, "results.json")
-RESULTS = {"model": "unknown", "distance_mode": DISTANCE_MODE.value, "tasks": {}}
-
-def save_results():
-    with open(RESULTS_PATH, "w") as f:
-        json.dump(RESULTS, f, indent=2)
-    print(f"  Results saved to {RESULTS_PATH}")
-
-if HAS_KBENCH:
-    _model_name = getattr(kbench.llm, "model", "unknown")
-    if _model_name == "unknown":
-        try:
-            _model_name = str(kbench.llm.prompt("What model are you? Reply with ONLY your model name, nothing else."))
-        except Exception:
-            _model_name = "unknown"
-    RESULTS["model"] = _model_name
-    print(f"\n{'='*60}")
-    print(f"  MODEL: {_model_name}")
-    print(f"  INSTANCES: {len(INSTANCES)} ({', '.join(p.name for p, _ in INSTANCES)})")
-    print(f"  DISTANCE MODE: {DISTANCE_MODE.value}")
-    print(f"  SCORE: 0.4 * coverage + 0.3 * feasibility + 0.3 * distance_gap")
-    print(f"{'='*60}")
-
-
-# =============================================================================
-# Task definitions (define all, only run the chosen one)
-# =============================================================================
-
-if HAS_KBENCH:
-
-    @kbench.task(name="pdptw_request_insertion")
-    def pdptw_request_insertion(llm) -> float:
-        """Insert removed requests back into a PDPTW solution via minimal insert-before/after ops."""
-        TASK_ID = "T1 1s"
-        TASK_TITLE = "Request Insertion (one-shot)"
-        scores = []
-        details = []
-        start = time.time()
-        print_task_header(TASK_ID, TASK_TITLE, len(INSTANCES), distance_mode_str="auto")
-        for i, (problem, bks) in enumerate(INSTANCES):
-            try:
-                if i > 0:
-                    time.sleep(10)
-                partial = bks.clone()
-                removed = []
-                required = set()
-                for pickup_idx, delivery_idx in problem.pickups_deliveries[:2]:
-                    partial.remove_request(problem, pickup_idx)
-                    removed.append((pickup_idx, delivery_idx))
-                    required.add(pickup_idx)
-                    required.add(delivery_idx)
-                prompt = build_request_insertion_prompt(problem, partial, removed, iterative_distance_mode(problem))
-                raw = llm_prompt(llm, prompt)
-                data = parse_json_response(raw)
-
-                parse_note = ""
-                if not isinstance(data, dict):
-                    parse_note = f"PARSE_FAIL(not_dict:{type(data).__name__})"
-                    insertions = None
-                elif not isinstance(data.get("insertions"), list):
-                    keys = list(data.keys())[:5]
-                    parse_note = f"PARSE_FAIL(no_insertions_key,got_keys={keys})"
-                    insertions = None
-                else:
-                    insertions = data["insertions"]
-
-                new_routes, applied, skipped = apply_insertions(partial.routes, insertions, required_nodes=required)
-                if not parse_note and applied == 0:
-                    first = skipped[0] if skipped else "empty_insertions_list"
-                    parse_note = f"APPLY_FAIL({first})"
-
-                solution = build_solution_from_llm_output(problem, new_routes)
-                components = compute_score(problem, solution, bks.total_distance)
-                score = components["score"]
-
-                d = {"instance": problem.name, "removed": removed, "bks_dist": round(bks.total_distance, 1),
-                     "insertions_applied": applied, "insertions_expected": len(required),
-                     "skipped": skipped[:5], "parse_note": parse_note,
-                     "raw_preview": str(raw)[:300] if parse_note else ""}
-                note_suffix = f" | {parse_note}" if parse_note else ""
-                if solution is None:
-                    d.update(result="BUILD_FAIL", **{k: round(v, 3) for k, v in components.items()})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | BUILD_FAIL applied={applied}/{len(required)}{note_suffix} | score=0.0")
-                else:
-                    d["llm_dist"] = round(solution.total_distance, 1)
-                    result = "FEASIBLE" if components["feasibility"] == 1.0 else "INFEASIBLE"
-                    d.update(result=result, **{k: round(v, 3) for k, v in components.items()})
-                    if result == "INFEASIBLE":
-                        d["violations"] = count_violations(problem, solution)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | INFEASIBLE applied={applied}/{len(required)} | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} | violations: {format_violations(d['violations'])}{note_suffix} | score={score:.3f}")
-                    else:
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | FEASIBLE applied={applied}/{len(required)} | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f}{note_suffix} | score={score:.3f}")
-
-                scores.append(score)
-                details.append(d)
-
-            except Exception as _e:
-                _err = f"{type(_e).__name__}: {_e}"
-                print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | ERROR: {_err}")
-                scores.append(0.0)
-                details.append({"instance": problem.name, "result": "ERROR", "error": _err})
-                try:
-                    save_results()
-                except Exception:
-                    pass
-                continue
-        avg = sum(scores) / len(scores)
-        elapsed = time.time() - start
-        print_task_footer(TASK_ID, TASK_TITLE, avg, scores, elapsed)
-        RESULTS["tasks"]["request_insertion"] = {"score": avg, "time_s": round(elapsed, 1), "instances": details}
-        save_results()
-        return avg
-
-
-    @kbench.task(name="pdptw_route_completion")
-    def pdptw_route_completion(llm) -> float:
-        """Reconstruct a missing route: BKS with one full route removed + its request list."""
-        TASK_ID = "T2 1s"
-        TASK_TITLE = "Route Completion (one-shot)"
-        scores = []
-        details = []
-        start = time.time()
-        print_task_header(TASK_ID, TASK_TITLE, len(INSTANCES), distance_mode_str="auto")
-        for i, (problem, bks) in enumerate(INSTANCES):
-            try:
-                if i > 0:
-                    time.sleep(10)
-                # Remove the longest BKS route entirely and extract its requests
-                longest_idx = max(range(len(bks.routes)), key=lambda r: len(bks.routes[r]))
-                removed_route = bks.routes[longest_idx]
-                removed_customers = set(removed_route[1:-1])
-                removed_requests = [(p, d) for p, d in problem.pickups_deliveries if p in removed_customers]
-                partial_routes = [r[:] for idx, r in enumerate(bks.routes) if idx != longest_idx]
-                partial = PDPTWSolution(problem=problem, routes=partial_routes)
-
-                prompt = build_route_completion_prompt(problem, partial, removed_requests, iterative_distance_mode(problem))
-                raw = llm_prompt(llm, prompt)
-                data = parse_json_response(raw)
-                d = {"instance": problem.name, "removed_route_len": len(removed_route), "n_requests": len(removed_requests), "bks_dist": round(bks.total_distance, 1)}
-
-                new_route = data.get("new_route", data.get("completed_route", None))
-                # Fallback: LLM returned a 'routes' list — take the first
-                if new_route is None and "routes" in data and isinstance(data["routes"], list) and data["routes"]:
-                    new_route = data["routes"][0]
-                if not isinstance(new_route, list):
-                    scores.append(0.0)
-                    details.append({**d, "result": "PARSE_FAIL", "coverage": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | PARSE_FAIL | score=0.0")
-                    continue
-
-                try:
-                    new_route = [int(n) for n in new_route]
-                except (ValueError, TypeError):
-                    scores.append(0.0)
-                    details.append({**d, "result": "PARSE_FAIL", "coverage": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | PARSE_FAIL | score=0.0")
-                    continue
-
-                if new_route and new_route[0] != 0:
-                    new_route.insert(0, 0)
-                if new_route and new_route[-1] != 0:
-                    new_route.append(0)
-
-                full_routes = [r[:] for r in partial.routes] + [new_route]
-                solution = build_solution_from_llm_output(problem, full_routes)
-                components = compute_score(problem, solution, bks.total_distance)
-                score = components["score"]
-
-                if solution is None:
-                    d.update(result="BUILD_FAIL", **{k: round(v, 3) for k, v in components.items()})
-                    details.append(d)
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | BUILD_FAIL | score=0.0")
-                else:
-                    d["llm_dist"] = round(solution.total_distance, 1)
-                    result = "FEASIBLE" if components["feasibility"] == 1.0 else "INFEASIBLE"
-                    d.update(result=result, **{k: round(v, 3) for k, v in components.items()})
-                    if result == "INFEASIBLE":
-                        d["violations"] = count_violations(problem, solution)
-                        details.append(d)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | INFEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} | violations: {format_violations(d['violations'])} | score={score:.3f}")
-                    else:
-                        details.append(d)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | FEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} | score={score:.3f}")
-
-                scores.append(score)
-
-            except Exception as _e:
-                _err = f"{type(_e).__name__}: {_e}"
-                print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | ERROR: {_err}")
-                scores.append(0.0)
-                details.append({"instance": problem.name, "result": "ERROR", "error": _err})
-                try:
-                    save_results()
-                except Exception:
-                    pass
-                continue
-        avg = sum(scores) / len(scores)
-        elapsed = time.time() - start
-        print_task_footer(TASK_ID, TASK_TITLE, avg, scores, elapsed)
-        RESULTS["tasks"]["route_completion"] = {"score": avg, "time_s": round(elapsed, 1), "instances": details}
-        save_results()
-        return avg
-
-
-    @kbench.task(name="pdptw_full_solution")
-    def pdptw_full_solution(llm) -> float:
-        """Generate a complete feasible PDPTW solution from scratch."""
-        TASK_ID = "T3 1s"
-        TASK_TITLE = "Full Solution (one-shot)"
-        scores = []
-        details = []
-        start = time.time()
-        print_task_header(TASK_ID, TASK_TITLE, len(INSTANCES), distance_mode_str="auto")
-        for i, (problem, bks) in enumerate(INSTANCES):
-            try:
-                if i > 0:
-                    time.sleep(10)
-                prompt = build_full_solution_prompt(problem, iterative_distance_mode(problem))
-                raw = llm_prompt(llm, prompt)
-                data = parse_json_response(raw)
-
-                routes_raw = data.get("routes", None)
-                solution = build_solution_from_llm_output(problem, routes_raw) if routes_raw else None
-                components = compute_score(problem, solution, bks.total_distance)
-                score = components["score"]
-                d = {"instance": problem.name, "nodes": len(problem.nodes), "vehicles": problem.num_vehicles, "bks_dist": round(bks.total_distance, 1)}
-
-                if solution is None:
-                    d.update(result="PARSE_FAIL", **{k: round(v, 3) for k, v in components.items()})
-                    details.append(d)
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} vehicles={problem.num_vehicles} | PARSE_FAIL | score=0.0")
-                else:
-                    n_served = sum(len(r) - 2 for r in solution.routes if len(r) > 2)
-                    n_expected = len(problem.nodes) - 1
-                    d.update(llm_dist=round(solution.total_distance, 1), served=n_served, expected=n_expected, routes=len(solution.routes))
-                    result = "FEASIBLE" if components["feasibility"] == 1.0 else "INFEASIBLE"
-                    d.update(result=result, **{k: round(v, 3) for k, v in components.items()})
-                    if result == "INFEASIBLE":
-                        d["violations"] = count_violations(problem, solution)
-                        details.append(d)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} | INFEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} served={n_served}/{n_expected} routes={len(solution.routes)} | violations: {format_violations(d['violations'])} | score={score:.3f}")
-                    else:
-                        details.append(d)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} | FEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} served={n_served}/{n_expected} | score={score:.3f}")
-
-                scores.append(score)
-
-            except Exception as _e:
-                _err = f"{type(_e).__name__}: {_e}"
-                print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | ERROR: {_err}")
-                scores.append(0.0)
-                details.append({"instance": problem.name, "result": "ERROR", "error": _err})
-                try:
-                    save_results()
-                except Exception:
-                    pass
-                continue
-        avg = sum(scores) / len(scores)
-        elapsed = time.time() - start
-        print_task_footer(TASK_ID, TASK_TITLE, avg, scores, elapsed)
-        RESULTS["tasks"]["full_solution"] = {"score": avg, "time_s": round(elapsed, 1), "instances": details}
-        save_results()
-        return avg
-
-
-    # =========================================================================
-    # Iterative variants (Tasks 2, 4, 5) — multi-turn
-    # =========================================================================
-
-    @kbench.task(name="pdptw_request_insertion_iterative")
-    def pdptw_request_insertion_iterative(llm) -> float:
-        """Insert removed requests one at a time over multiple turns (one request per turn)."""
-        TASK_ID = "T1 iter"
-        TASK_TITLE = "Request Insertion (iterative)"
-        scores = []
-        details = []
-        start = time.time()
-        print_task_header(TASK_ID, TASK_TITLE, len(INSTANCES), distance_mode_str="auto")
-        for i, (problem, bks) in enumerate(INSTANCES):
-            try:
-                if i > 0:
-                    time.sleep(10)
-                partial = bks.clone()
-                removed = []
-                for pickup_idx, delivery_idx in problem.pickups_deliveries[:2]:
-                    partial.remove_request(problem, pickup_idx)
-                    removed.append((pickup_idx, delivery_idx))
-
-                total_applied = [0]
-                total_skipped = []
-
-                iter_mode = iterative_distance_mode(problem)
-                def state_builder(step, state, history_text, _problem=problem, _mode=iter_mode):
-                    return build_iterative_insertion_step_prompt(_problem, state, step, _mode, history_text)
-
-                def response_extractor(data, state, step, _totals_applied=total_applied, _totals_skipped=total_skipped):
-                    if not isinstance(data, dict):
-                        return None
-                    insertions = data.get("insertions")
-                    pickup_idx, delivery_idx = step
-                    required = {pickup_idx, delivery_idx}
-                    new_routes, applied, skipped = apply_insertions(state, insertions, required_nodes=required)
-                    _totals_applied[0] += applied
-                    _totals_skipped.extend(skipped)
-                    return new_routes  # may be unchanged if all ops were skipped; driver continues
-
-                final_state, turns_used, abort = run_iterative_steps(
-                    llm, problem, removed, state_builder, response_extractor, initial_state=[list(r) for r in partial.routes]
-                )
-                solution = build_solution_from_llm_output(problem, final_state) if final_state is not None else None
-                components = compute_score(problem, solution, bks.total_distance) if abort is None else {"coverage": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0}
-                score = components["score"]
-
-                d = {"instance": problem.name, "removed": removed, "bks_dist": round(bks.total_distance, 1),
-                     "turns": turns_used, "max_turns": len(removed),
-                     "insertions_applied": total_applied[0], "insertions_expected": 2 * len(removed),
-                     "skipped": total_skipped[:5]}
-                if abort is not None:
-                    d.update(result="ABORT", abort=abort, **{k: round(v, 3) for k, v in components.items()})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | ABORT({abort}) | score={score:.3f}")
-                elif solution is None:
-                    d.update(result="BUILD_FAIL", **{k: round(v, 3) for k, v in components.items()})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | BUILD_FAIL | score=0.0")
-                else:
-                    d["llm_dist"] = round(solution.total_distance, 1)
-                    result = "FEASIBLE" if components["feasibility"] == 1.0 else "INFEASIBLE"
-                    d.update(result=result, **{k: round(v, 3) for k, v in components.items()})
-                    if result == "INFEASIBLE":
-                        d["violations"] = count_violations(problem, solution)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | INFEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} | violations: {format_violations(d['violations'])} | score={score:.3f}")
-                    else:
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | FEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} | score={score:.3f}")
-
-                scores.append(score)
-                details.append(d)
-
-            except Exception as _e:
-                _err = f"{type(_e).__name__}: {_e}"
-                print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | ERROR: {_err}")
-                scores.append(0.0)
-                details.append({"instance": problem.name, "result": "ERROR", "error": _err})
-                try:
-                    save_results()
-                except Exception:
-                    pass
-                continue
-        avg = sum(scores) / len(scores)
-        elapsed = time.time() - start
-        print_task_footer(TASK_ID, TASK_TITLE, avg, scores, elapsed)
-        RESULTS["tasks"]["request_insertion_iterative"] = {"score": avg, "time_s": round(elapsed, 1), "instances": details}
-        save_results()
-        return avg
-
-
-    @kbench.task(name="pdptw_route_completion_iterative")
-    def pdptw_route_completion_iterative(llm) -> float:
-        """Reconstruct a missing route by inserting its requests one at a time."""
-        TASK_ID = "T2 iter"
-        TASK_TITLE = "Route Completion (iterative)"
-        scores = []
-        details = []
-        start = time.time()
-        print_task_header(TASK_ID, TASK_TITLE, len(INSTANCES), distance_mode_str="auto")
-        for i, (problem, bks) in enumerate(INSTANCES):
-            try:
-                if i > 0:
-                    time.sleep(10)
-                longest_idx = max(range(len(bks.routes)), key=lambda r: len(bks.routes[r]))
-                removed_route = bks.routes[longest_idx]
-                removed_customers = set(removed_route[1:-1])
-                removed_requests = [(p, d) for p, d in problem.pickups_deliveries if p in removed_customers]
-                partial_routes = [r[:] for idx, r in enumerate(bks.routes) if idx != longest_idx]
-                partial = PDPTWSolution(problem=problem, routes=partial_routes)
-
-                iter_mode = iterative_distance_mode(problem)
-                def state_builder(step, state, history_text, _problem=problem, _partial=partial, _mode=iter_mode):
-                    return build_iterative_route_build_step_prompt(
-                        _problem, _partial.routes, state, step, _mode, history_text
-                    )
-
-                def response_extractor(data, state, step):
-                    if not isinstance(data, dict):
-                        return None
-                    new_route = data.get("new_route") or data.get("route")
-                    if new_route is None and "routes" in data and isinstance(data["routes"], list) and data["routes"]:
-                        new_route = data["routes"][0]
-                    if not isinstance(new_route, list):
-                        return None
-                    try:
-                        nr = [int(n) for n in new_route]
-                    except (ValueError, TypeError):
-                        return None
-                    if not nr or nr[0] != 0:
-                        nr = [0] + nr
-                    if nr[-1] != 0:
-                        nr.append(0)
-                    return nr
-
-                initial_new_route = [0, 0]
-                final_route, turns_used, abort = run_iterative_steps(
-                    llm, problem, removed_requests, state_builder, response_extractor, initial_state=initial_new_route
-                )
-                d = {"instance": problem.name, "n_requests": len(removed_requests),
-                     "bks_dist": round(bks.total_distance, 1), "turns": turns_used, "max_turns": len(removed_requests)}
-
-                if abort is not None or not final_route:
-                    zero = {"coverage": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0}
-                    scores.append(0.0)
-                    details.append({**d, "result": "ABORT", "abort": abort, **zero})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | turns={turns_used}/{len(removed_requests)} | ABORT({abort}) | score=0.0")
-                    continue
-
-                full_routes = [r[:] for r in partial.routes] + [final_route]
-                solution = build_solution_from_llm_output(problem, full_routes)
-                components = compute_score(problem, solution, bks.total_distance)
-                score = components["score"]
-                if solution is None:
-                    scores.append(0.0)
-                    details.append({**d, "result": "BUILD_FAIL", **{k: round(v, 3) for k, v in components.items()}})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | turns={turns_used}/{len(removed_requests)} | BUILD_FAIL | score=0.0")
-                    continue
-
-                d["llm_dist"] = round(solution.total_distance, 1)
-                result = "FEASIBLE" if components["feasibility"] == 1.0 else "INFEASIBLE"
-                d.update(result=result, **{k: round(v, 3) for k, v in components.items()})
-                if result == "INFEASIBLE":
-                    d["violations"] = count_violations(problem, solution)
-                    details.append(d)
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | turns={turns_used}/{len(removed_requests)} | INFEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} | violations: {format_violations(d['violations'])} | score={score:.3f}")
-                else:
-                    details.append(d)
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | turns={turns_used}/{len(removed_requests)} | FEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} | score={score:.3f}")
-                scores.append(score)
-
-            except Exception as _e:
-                _err = f"{type(_e).__name__}: {_e}"
-                print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | ERROR: {_err}")
-                scores.append(0.0)
-                details.append({"instance": problem.name, "result": "ERROR", "error": _err})
-                try:
-                    save_results()
-                except Exception:
-                    pass
-                continue
-        avg = sum(scores) / len(scores)
-        elapsed = time.time() - start
-        print_task_footer(TASK_ID, TASK_TITLE, avg, scores, elapsed)
-        RESULTS["tasks"]["route_completion_iterative"] = {"score": avg, "time_s": round(elapsed, 1), "instances": details}
-        save_results()
-        return avg
-
-
-    @kbench.task(name="pdptw_full_solution_iterative")
-    def pdptw_full_solution_iterative(llm) -> float:
-        """Generate a complete solution route-by-route over multiple turns."""
-        TASK_ID = "T3 iter"
-        TASK_TITLE = "Full Solution (iterative)"
-        scores = []
-        details = []
-        start = time.time()
-        print_task_header(TASK_ID, TASK_TITLE, len(INSTANCES), distance_mode_str="auto")
-        for i, (problem, bks) in enumerate(INSTANCES):
-            try:
-                if i > 0:
-                    time.sleep(10)
-                all_requests = list(problem.pickups_deliveries)
-                unserved = list(all_requests)
-                completed_routes = []
-                # Cap at 10 to keep per-instance wall-clock tractable. 25-vehicle
-                # instances like lc101 otherwise compound with retries and the
-                # matrix-on-every-turn problem.
-                max_turns = min(problem.num_vehicles, 10)
-                turns_used = 0
-                abort = None
-                history = []
-                iter_mode = iterative_distance_mode(problem)
-                MAX_PARSE_RETRIES = 2
-
-                for turn_idx in range(max_turns):
-                    if not unserved:
-                        break
-                    step_done = False
-                    for parse_attempt in range(MAX_PARSE_RETRIES + 1):
-                        history_text = format_conversation_history(history)
-                        prompt = build_iterative_full_route_step_prompt(
-                            problem, completed_routes, unserved, iter_mode, history_text
-                        )
-                        raw = llm_prompt(llm, prompt)
-                        turns_used += 1
-                        data = parse_json_response(raw)
-                        if not isinstance(data, dict):
-                            history.append({"assistant": raw,
-                                            "system": "Your last response could not be parsed as JSON. "
-                                                      "Respond with EXACTLY the JSON schema shown."})
-                            continue
-                        if data.get("done") is True:
-                            history.append({"assistant": raw})
-                            step_done = True
-                            abort = "__done__"
-                            break
-                        route_raw = data.get("route") or data.get("new_route")
-                        if route_raw is None:
-                            history.append({"assistant": raw,
-                                            "system": 'Your last response had no "route" field. '
-                                                      'Respond with {"route": [0, ..., 0]} or {"done": true}.'})
-                            continue
-                        try:
-                            route = [int(n) for n in route_raw]
-                        except (ValueError, TypeError):
-                            history.append({"assistant": raw,
-                                            "system": "Your last route contained non-integer values. "
-                                                      "Respond with a list of integer node indices."})
-                            continue
-                        if not route or route[0] != 0:
-                            route = [0] + route
-                        if route[-1] != 0:
-                            route.append(0)
-                        completed_routes.append(route)
-                        visited = set(route[1:-1])
-                        unserved = [(p, d) for (p, d) in unserved if p not in visited and d not in visited]
-                        history.append({"assistant": raw})
-                        step_done = True
-                        break
-                    if abort == "__done__":
-                        abort = None
-                        break
-                    if not step_done:
-                        abort = f"parse_fail_turn_{turn_idx+1}"
-                        break
-
-                d = {"instance": problem.name, "bks_dist": round(bks.total_distance, 1),
-                     "turns": turns_used, "max_turns": max_turns, "unserved": len(unserved)}
-
-                if abort is not None:
-                    zero = {"coverage": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0}
-                    scores.append(0.0)
-                    details.append({**d, "result": "ABORT", "abort": abort, **zero})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} unserved={len(unserved)} | ABORT({abort}) | score=0.0")
-                    continue
-
-                solution = build_solution_from_llm_output(problem, completed_routes)
-                components = compute_score(problem, solution, bks.total_distance)
-                score = components["score"]
-                if solution is None:
-                    scores.append(0.0)
-                    details.append({**d, "result": "BUILD_FAIL", **{k: round(v, 3) for k, v in components.items()}})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} | BUILD_FAIL | score=0.0")
-                    continue
-
-                d["llm_dist"] = round(solution.total_distance, 1)
-                result = "FEASIBLE" if components["feasibility"] == 1.0 else "INFEASIBLE"
-                d.update(result=result, **{k: round(v, 3) for k, v in components.items()})
-                if result == "INFEASIBLE":
-                    d["violations"] = count_violations(problem, solution)
-                    details.append(d)
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} | INFEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} | violations: {format_violations(d['violations'])} | score={score:.3f}")
-                else:
-                    details.append(d)
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} | FEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} | score={score:.3f}")
-                scores.append(score)
-
-            except Exception as _e:
-                _err = f"{type(_e).__name__}: {_e}"
-                print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | ERROR: {_err}")
-                scores.append(0.0)
-                details.append({"instance": problem.name, "result": "ERROR", "error": _err})
-                try:
-                    save_results()
-                except Exception:
-                    pass
-                continue
-        avg = sum(scores) / len(scores)
-        elapsed = time.time() - start
-        print_task_footer(TASK_ID, TASK_TITLE, avg, scores, elapsed)
-        RESULTS["tasks"]["full_solution_iterative"] = {"score": avg, "time_s": round(elapsed, 1), "instances": details}
-        save_results()
-        return avg
-
-
-else:
-    print("kbench not available - run this notebook on Kaggle to execute the benchmark")
-
-
-# =============================================================================
-# RUN TASKS
-# On Kaggle: each task.run() + %choose should be in its OWN CELL.
-# The %choose comment registers the task score with the Benchmarks platform.
-# You can run all 6 cells to evaluate all tasks in one session.
-# =============================================================================
-
-# --- CELL: Insertion (one-shot) ---
-if HAS_KBENCH:
-    pdptw_request_insertion.run(llm=kbench.llm)
-# %choose pdptw_request_insertion
-
-# --- CELL: Route Completion (one-shot) ---
-if HAS_KBENCH:
-    pdptw_route_completion.run(llm=kbench.llm)
-# %choose pdptw_route_completion
-
-# --- CELL: Full Solution (one-shot) ---
-if HAS_KBENCH:
-    pdptw_full_solution.run(llm=kbench.llm)
-# %choose pdptw_full_solution
-
-# --- CELL: Insertion (iterative) ---
-if HAS_KBENCH:
-    pdptw_request_insertion_iterative.run(llm=kbench.llm)
-# %choose pdptw_request_insertion_iterative
-
-# --- CELL: Route Completion (iterative) ---
-if HAS_KBENCH:
-    pdptw_route_completion_iterative.run(llm=kbench.llm)
-# %choose pdptw_route_completion_iterative
-
-# --- CELL: Full Solution (iterative) ---
-if HAS_KBENCH:
-    pdptw_full_solution_iterative.run(llm=kbench.llm)
-# %choose pdptw_full_solution_iterative
+def save_results(results, path):
+    """Write results dict to JSON file."""
+    with open(path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  Results saved to {path}")
