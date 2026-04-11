@@ -58,7 +58,7 @@ if HAS_KBENCH:
     print(f"\n{'='*60}")
     print(f"  MODEL: {_model_name}")
     print(f"  INSTANCES: {len(INSTANCES)} ({', '.join(p.name for p, _ in INSTANCES)})")
-    print(f"  SCORE: 0.4 * coverage + 0.3 * feasibility + 0.3 * distance_gap")
+    print(f"  SCORE: (1/3) * completion + (1/3) * feasibility + (1/3) * distance_gap")
     print(f"{'='*60}")
 
 # %%
@@ -104,8 +104,9 @@ if HAS_KBENCH:
                 final_state, turns_used, abort = run_iterative_steps(
                     llm, problem, removed, state_builder, response_extractor, initial_state=[list(r) for r in partial.routes]
                 )
+                completion = score_completion_t1(final_state or [], removed)
                 solution = build_solution_from_llm_output(problem, final_state) if final_state is not None else None
-                components = compute_score(problem, solution, bks.total_distance) if abort is None else {"coverage": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0}
+                components = compute_score(problem, solution, bks.total_distance, completion)
                 score = components["score"]
 
                 d = {"instance": problem.name, "removed": removed, "bks_dist": round(bks.total_distance, 1),
@@ -114,19 +115,19 @@ if HAS_KBENCH:
                      "skipped": total_skipped[:5]}
                 if abort is not None:
                     d.update(result="ABORT", abort=abort, **{k: round(v, 3) for k, v in components.items()})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | ABORT({abort}) | score={score:.3f}")
+                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | ABORT({abort}) | compl={completion:.2f} | score={score:.3f}")
                 elif solution is None:
                     d.update(result="BUILD_FAIL", **{k: round(v, 3) for k, v in components.items()})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | BUILD_FAIL | score=0.0")
+                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | BUILD_FAIL | compl={completion:.2f} | score={score:.3f}")
                 else:
                     d["llm_dist"] = round(solution.total_distance, 1)
                     result = "FEASIBLE" if components["feasibility"] == 1.0 else "INFEASIBLE"
                     d.update(result=result, **{k: round(v, 3) for k, v in components.items()})
                     if result == "INFEASIBLE":
                         d["violations"] = count_violations(problem, solution)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | INFEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} | violations: {format_violations(d['violations'])} | score={score:.3f}")
+                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | INFEASIBLE | compl={completion:.2f} llm_dist={solution.total_distance:.1f} | violations: {format_violations(d['violations'])} | score={score:.3f}")
                     else:
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | FEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} | score={score:.3f}")
+                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | turns={turns_used}/{len(removed)} | FEASIBLE | compl={completion:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} | score={score:.3f}")
 
                 scores.append(score)
                 details.append(d)

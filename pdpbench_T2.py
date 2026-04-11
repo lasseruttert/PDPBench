@@ -41,7 +41,7 @@ _log_file = open(LOG_PATH, "w", encoding="utf-8")
 sys.stdout = Tee(sys.__stdout__, _log_file)
 sys.stderr = Tee(sys.__stderr__, _log_file)
 
-INSTANCES = get_benchmark_instances()
+INSTANCES = get_benchmark_instances_20()
 print(f"Loaded {len(INSTANCES)} instances")
 
 RESULTS_PATH = "/kaggle/working/results_T2.json" if KAGGLE else os.path.join(BASE_DIR, "results_T2.json")
@@ -58,7 +58,7 @@ if HAS_KBENCH:
     print(f"\n{'='*60}")
     print(f"  MODEL: {_model_name}")
     print(f"  INSTANCES: {len(INSTANCES)} ({', '.join(p.name for p, _ in INSTANCES)})")
-    print(f"  SCORE: 0.4 * coverage + 0.3 * feasibility + 0.3 * distance_gap")
+    print(f"  SCORE: (1/3) * completion + (1/3) * feasibility + (1/3) * distance_gap")
     print(f"{'='*60}")
 
 # %%
@@ -97,7 +97,7 @@ if HAS_KBENCH:
 
                 if not isinstance(new_route, list):
                     scores.append(0.0)
-                    details.append({**d, "result": "PARSE_FAIL", "coverage": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0})
+                    details.append({**d, "result": "PARSE_FAIL", "completion": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0})
                     print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | PARSE_FAIL | score=0.0")
                     continue
 
@@ -105,7 +105,7 @@ if HAS_KBENCH:
                     new_route = [int(n) for n in new_route]
                 except (ValueError, TypeError):
                     scores.append(0.0)
-                    details.append({**d, "result": "PARSE_FAIL", "coverage": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0})
+                    details.append({**d, "result": "PARSE_FAIL", "completion": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0})
                     print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | PARSE_FAIL | score=0.0")
                     continue
 
@@ -114,15 +114,16 @@ if HAS_KBENCH:
                 if new_route and new_route[-1] != 0:
                     new_route.append(0)
 
+                completion = score_completion_t2(new_route, removed_customers)
                 full_routes = [r[:] for r in partial.routes] + [new_route]
                 solution = build_solution_from_llm_output(problem, full_routes)
-                components = compute_score(problem, solution, bks.total_distance)
+                components = compute_score(problem, solution, bks.total_distance, completion)
                 score = components["score"]
 
                 if solution is None:
                     d.update(result="BUILD_FAIL", **{k: round(v, 3) for k, v in components.items()})
                     details.append(d)
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | BUILD_FAIL | score=0.0")
+                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | BUILD_FAIL | compl={completion:.2f} | score={score:.3f}")
                 else:
                     d["llm_dist"] = round(solution.total_distance, 1)
                     result = "FEASIBLE" if components["feasibility"] == 1.0 else "INFEASIBLE"
@@ -130,10 +131,10 @@ if HAS_KBENCH:
                     if result == "INFEASIBLE":
                         d["violations"] = count_violations(problem, solution)
                         details.append(d)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | INFEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} | violations: {format_violations(d['violations'])} | score={score:.3f}")
+                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | INFEASIBLE | compl={completion:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} | violations: {format_violations(d['violations'])} | score={score:.3f}")
                     else:
                         details.append(d)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | FEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} | score={score:.3f}")
+                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | requests={len(removed_requests)} | FEASIBLE | compl={completion:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} | score={score:.3f}")
 
                 scores.append(score)
 

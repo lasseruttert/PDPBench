@@ -171,8 +171,18 @@ def apply_insertions(partial_routes, insertions, required_nodes=None):
     return routes, applied, skipped
 
 
-def score_feasibility(problem, solution):
-    return 1.0 if is_feasible(problem, solution) else 0.0
+def score_feasibility_scaled(problem, solution):
+    """1/(1+v)^2 where v = total constraint violations. 1.0 if feasible, 0.0 if None.
+
+    Quadratic decay gives a large penalty on the first violation (1.0→0.25)
+    with progressively smaller reductions for each additional violation.
+    """
+    if solution is None:
+        return 0.0
+    if is_feasible(problem, solution):
+        return 1.0
+    total_v = sum(count_violations(problem, solution).values())
+    return 1.0 / (1.0 + total_v) ** 2
 
 
 def count_violations(problem, solution):
@@ -294,17 +304,16 @@ def score_distance_gap(actual_distance, bks_distance):
     return max(0.0, 1.0 - gap)
 
 
-def score_coverage(problem, solution):
-    """Fraction of requests where pickup AND delivery appear exactly once in the
-    solution, in the same route, with pickup before delivery.
+def score_completion_t1(routes, removed_pairs):
+    """T1/T4: fraction of removed pairs correctly re-inserted.
 
-    Structural-only: does not check capacity or time windows. Captures how much
-    of the problem the LLM actually tracked, independent of constraint handling.
+    A pair is correct if both pickup and delivery appear exactly once,
+    in the same route, with pickup before delivery.
     """
-    if solution is None or not getattr(solution, "routes", None):
+    if not routes or not removed_pairs:
         return 0.0
-    positions = {}  # node_index -> (route_idx, pos) or "DUP"
-    for r_idx, route in enumerate(solution.routes):
+    positions = {}
+    for r_idx, route in enumerate(routes):
         for p_idx, node in enumerate(route):
             if node == 0:
                 continue
@@ -312,11 +321,8 @@ def score_coverage(problem, solution):
                 positions[node] = "DUP"
             else:
                 positions[node] = (r_idx, p_idx)
-    num_requests = len(problem.pickups_deliveries)
-    if num_requests == 0:
-        return 1.0
     correct = 0
-    for p, d in problem.pickups_deliveries:
+    for p, d in removed_pairs:
         pp = positions.get(p)
         dd = positions.get(d)
         if pp is None or dd is None or pp == "DUP" or dd == "DUP":
@@ -325,25 +331,43 @@ def score_coverage(problem, solution):
         dr, di = dd
         if pr == dr and pi < di:
             correct += 1
-    return correct / num_requests
+    return correct / len(removed_pairs)
 
 
-def compute_score(problem, solution, bks_distance):
-    """Unified score for all tasks: 0.4*coverage + 0.3*feasibility + 0.3*distance_gap.
+def score_completion_t2(new_route, required_nodes):
+    """T2/T5: fraction of required customer nodes present in the new route."""
+    if not new_route or not required_nodes:
+        return 0.0
+    present = set(n for n in new_route if n != 0)
+    return len(present & required_nodes) / len(required_nodes)
 
-    - coverage: structural (requests correctly placed), partial credit
-    - feasibility: binary (all constraints satisfied)
-    - distance_gap: vs BKS, only awarded when feasible (else 0)
 
-    Returns a dict with all four components. A None solution scores 0 across the board.
+def score_completion_t3(routes, pickups_deliveries):
+    """T3/T6: fraction of requests where both pickup and delivery are present anywhere."""
+    if not routes or not pickups_deliveries:
+        return 0.0
+    present = set()
+    for route in routes:
+        for node in route:
+            if node != 0:
+                present.add(node)
+    correct = sum(1 for p, d in pickups_deliveries if p in present and d in present)
+    return correct / len(pickups_deliveries)
+
+
+def compute_score(problem, solution, bks_distance, completion):
+    """Unified score: (1/3)*completion + (1/3)*feasibility_scaled + (1/3)*distance_gap.
+
+    - completion: task-specific, computed before this call from raw routes
+    - feasibility_scaled: 1.0 if feasible, 1/(1+violations) otherwise
+    - distance_gap: vs BKS distance, always awarded (not gated on feasibility)
+
+    Returns a dict with all four components.
     """
-    if solution is None:
-        return {"coverage": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0}
-    coverage = score_coverage(problem, solution)
-    feasibility = score_feasibility(problem, solution)
-    distance_gap = score_distance_gap(solution.total_distance, bks_distance) if feasibility == 1.0 else 0.0
-    score = 0.4 * coverage + 0.3 * feasibility + 0.3 * distance_gap
-    return {"coverage": coverage, "feasibility": feasibility, "distance_gap": distance_gap, "score": score}
+    feasibility = score_feasibility_scaled(problem, solution)
+    distance_gap = score_distance_gap(solution.total_distance, bks_distance) if solution is not None else 0.0
+    score = (completion + feasibility + distance_gap) / 3.0
+    return {"completion": completion, "feasibility": feasibility, "distance_gap": distance_gap, "score": score}
 
 
 # =============================================================================
@@ -1199,6 +1223,20 @@ LI_LIM_INSTANCES = ["lc101", "lc201", "lr101", "lr201", "lrc101"]
 MENDELEY_INSTANCES = ["bar-n100-1", "ber-n100-1", "nyc-n100-1"]
 DISTANCE_MODE = DistanceMode.MATRIX
 
+LI_LIM_INSTANCES_20 = [
+    "lc101", "lc102",
+    "lc201", "lc202",
+    "lr101", "lr102",
+    "lr201", "lr202",
+    "lrc101", "lrc102",
+]
+MENDELEY_INSTANCES_20 = [
+    "bar-n100-1", "bar-n100-2", "bar-n100-3",
+    "ber-n100-1", "ber-n100-2", "ber-n100-3",
+    "nyc-n100-1", "nyc-n100-2",
+    "poa-n100-1", "poa-n100-2",
+]
+
 
 def iterative_distance_mode(problem):
     """Pick a distance mode for iterative tasks.
@@ -1224,6 +1262,23 @@ def get_benchmark_instances():
         solution = bks.get_bks_as_solution(problem)
         instances.append((problem, solution))
     for name in MENDELEY_INSTANCES:
+        problem = mendeley_mgr.load(name, size=100)
+        solution = bks.get_bks_as_solution(problem)
+        instances.append((problem, solution))
+    return instances
+
+
+def get_benchmark_instances_20():
+    """Load 20 benchmark instances for T1–T3 (10 Li & Lim + 10 Mendeley)."""
+    li_lim_mgr = LiLimInstanceManager(base_dir=DATA_DIR)
+    mendeley_mgr = MendeleyInstanceManager(base_dir=DATA_DIR)
+    bks = BestKnownSolutions(bks_path=BKS_DIR)
+    instances = []
+    for name in LI_LIM_INSTANCES_20:
+        problem = li_lim_mgr.load(name, size=100)
+        solution = bks.get_bks_as_solution(problem)
+        instances.append((problem, solution))
+    for name in MENDELEY_INSTANCES_20:
         problem = mendeley_mgr.load(name, size=100)
         solution = bks.get_bks_as_solution(problem)
         instances.append((problem, solution))

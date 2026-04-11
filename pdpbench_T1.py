@@ -41,7 +41,7 @@ _log_file = open(LOG_PATH, "w", encoding="utf-8")
 sys.stdout = Tee(sys.__stdout__, _log_file)
 sys.stderr = Tee(sys.__stderr__, _log_file)
 
-INSTANCES = get_benchmark_instances()
+INSTANCES = get_benchmark_instances_20()
 print(f"Loaded {len(INSTANCES)} instances")
 
 RESULTS_PATH = "/kaggle/working/results_T1.json" if KAGGLE else os.path.join(BASE_DIR, "results_T1.json")
@@ -58,7 +58,7 @@ if HAS_KBENCH:
     print(f"\n{'='*60}")
     print(f"  MODEL: {_model_name}")
     print(f"  INSTANCES: {len(INSTANCES)} ({', '.join(p.name for p, _ in INSTANCES)})")
-    print(f"  SCORE: 0.4 * coverage + 0.3 * feasibility + 0.3 * distance_gap")
+    print(f"  SCORE: (1/3) * completion + (1/3) * feasibility + (1/3) * distance_gap")
     print(f"{'='*60}")
 
 # %%
@@ -105,8 +105,9 @@ if HAS_KBENCH:
                     first = skipped[0] if skipped else "empty_insertions_list"
                     parse_note = f"APPLY_FAIL({first})"
 
+                completion = score_completion_t1(new_routes, removed)
                 solution = build_solution_from_llm_output(problem, new_routes)
-                components = compute_score(problem, solution, bks.total_distance)
+                components = compute_score(problem, solution, bks.total_distance, completion)
                 score = components["score"]
 
                 d = {"instance": problem.name, "removed": removed, "bks_dist": round(bks.total_distance, 1),
@@ -116,16 +117,16 @@ if HAS_KBENCH:
                 note_suffix = f" | {parse_note}" if parse_note else ""
                 if solution is None:
                     d.update(result="BUILD_FAIL", **{k: round(v, 3) for k, v in components.items()})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | BUILD_FAIL applied={applied}/{len(required)}{note_suffix} | score=0.0")
+                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | BUILD_FAIL applied={applied}/{len(required)}{note_suffix} | compl={completion:.2f} | score={score:.3f}")
                 else:
                     d["llm_dist"] = round(solution.total_distance, 1)
                     result = "FEASIBLE" if components["feasibility"] == 1.0 else "INFEASIBLE"
                     d.update(result=result, **{k: round(v, 3) for k, v in components.items()})
                     if result == "INFEASIBLE":
                         d["violations"] = count_violations(problem, solution)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | INFEASIBLE applied={applied}/{len(required)} | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} | violations: {format_violations(d['violations'])}{note_suffix} | score={score:.3f}")
+                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | INFEASIBLE applied={applied}/{len(required)} | compl={completion:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} | violations: {format_violations(d['violations'])}{note_suffix} | score={score:.3f}")
                     else:
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | FEASIBLE applied={applied}/{len(required)} | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f}{note_suffix} | score={score:.3f}")
+                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | removed={removed} | FEASIBLE applied={applied}/{len(required)} | compl={completion:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f}{note_suffix} | score={score:.3f}")
 
                 scores.append(score)
                 details.append(d)

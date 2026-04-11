@@ -11,8 +11,6 @@ DIRS_TO_COPY = ["data", "bks", "utils"]
 
 # Python modules to copy (the benchmark code)
 FILES_TO_COPY = [
-    "pdpbench.py",
-    "pdpbench_kaggle.py",   # monolith kept for backward compat
     "pdpbench_lib.py",      # shared library imported by all per-task files
     "pdpbench_T1.py",       # Task 1: Request Insertion (one-shot)
     "pdpbench_T2.py",       # Task 2: Route Completion (one-shot)

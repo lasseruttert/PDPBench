@@ -41,7 +41,7 @@ _log_file = open(LOG_PATH, "w", encoding="utf-8")
 sys.stdout = Tee(sys.__stdout__, _log_file)
 sys.stderr = Tee(sys.__stderr__, _log_file)
 
-INSTANCES = get_benchmark_instances()
+INSTANCES = get_benchmark_instances_20()
 print(f"Loaded {len(INSTANCES)} instances")
 
 RESULTS_PATH = "/kaggle/working/results_T3.json" if KAGGLE else os.path.join(BASE_DIR, "results_T3.json")
@@ -58,7 +58,7 @@ if HAS_KBENCH:
     print(f"\n{'='*60}")
     print(f"  MODEL: {_model_name}")
     print(f"  INSTANCES: {len(INSTANCES)} ({', '.join(p.name for p, _ in INSTANCES)})")
-    print(f"  SCORE: 0.4 * coverage + 0.3 * feasibility + 0.3 * distance_gap")
+    print(f"  SCORE: (1/3) * completion + (1/3) * feasibility + (1/3) * distance_gap")
     print(f"{'='*60}")
 
 if HAS_KBENCH:
@@ -81,15 +81,16 @@ if HAS_KBENCH:
                 data = parse_json_response(raw)
 
                 routes_raw = data.get("routes", None)
+                completion = score_completion_t3(routes_raw or [], problem.pickups_deliveries)
                 solution = build_solution_from_llm_output(problem, routes_raw) if routes_raw else None
-                components = compute_score(problem, solution, bks.total_distance)
+                components = compute_score(problem, solution, bks.total_distance, completion)
                 score = components["score"]
                 d = {"instance": problem.name, "nodes": len(problem.nodes), "vehicles": problem.num_vehicles, "bks_dist": round(bks.total_distance, 1)}
 
                 if solution is None:
                     d.update(result="PARSE_FAIL", **{k: round(v, 3) for k, v in components.items()})
                     details.append(d)
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} vehicles={problem.num_vehicles} | PARSE_FAIL | score=0.0")
+                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} vehicles={problem.num_vehicles} | PARSE_FAIL | compl={completion:.2f} | score={score:.3f}")
                 else:
                     n_served = sum(len(r) - 2 for r in solution.routes if len(r) > 2)
                     n_expected = len(problem.nodes) - 1
@@ -99,10 +100,10 @@ if HAS_KBENCH:
                     if result == "INFEASIBLE":
                         d["violations"] = count_violations(problem, solution)
                         details.append(d)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} | INFEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} served={n_served}/{n_expected} routes={len(solution.routes)} | violations: {format_violations(d['violations'])} | score={score:.3f}")
+                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} | INFEASIBLE | compl={completion:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} served={n_served}/{n_expected} routes={len(solution.routes)} | violations: {format_violations(d['violations'])} | score={score:.3f}")
                     else:
                         details.append(d)
-                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} | FEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} served={n_served}/{n_expected} | score={score:.3f}")
+                        print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | nodes={len(problem.nodes)} | FEASIBLE | compl={completion:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} served={n_served}/{n_expected} | score={score:.3f}")
 
                 scores.append(score)
 

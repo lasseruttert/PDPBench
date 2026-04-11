@@ -76,10 +76,6 @@ def build_solution_from_llm_output(problem, routes_raw):
         return None
 
 
-def score_feasibility(problem, solution):
-    return 1.0 if is_feasible(problem, solution) else 0.0
-
-
 def score_distance_gap(actual_distance, bks_distance):
     if bks_distance <= 0:
         return 0.0
@@ -114,7 +110,7 @@ print("=" * 60)
 print("TEST: Request Insertion — insert-op schema")
 print("=" * 60)
 
-import pdpbench as _pdb_early  # used for apply_insertions/compute_score/score_coverage
+import pdpbench_lib as _pdb_early  # used for apply_insertions/compute_score/score_completion_t1
 
 partial = bks.clone()
 removed = []
@@ -176,9 +172,10 @@ new_routes, applied, skipped = _pdb_early.apply_insertions(fresh_partial.routes,
 assert applied == 2 * len(removed), f"expected {2*len(removed)} applied, got {applied} skipped={skipped}"
 sol_ins = _pdb_early.build_solution_from_llm_output(problem, new_routes)
 assert sol_ins is not None, "insertion result should build"
-components = _pdb_early.compute_score(problem, sol_ins, bks.total_distance)
-print(f"  Valid insertions: applied={applied}/{2*len(removed)} coverage={components['coverage']:.3f} feas={components['feasibility']} score={components['score']:.3f}")
-assert components["coverage"] == 1.0, f"expected coverage 1.0 after all insertions applied, got {components['coverage']}"
+completion = _pdb_early.score_completion_t1(new_routes, removed)
+components = _pdb_early.compute_score(problem, sol_ins, bks.total_distance, completion)
+print(f"  Valid insertions: applied={applied}/{2*len(removed)} compl={components['completion']:.3f} feas={components['feasibility']} score={components['score']:.3f}")
+assert components["completion"] == 1.0, f"expected completion 1.0 after all insertions applied, got {components['completion']}"
 
 # Test B: Bad anchor — pickup references a non-existent node; skipped silently.
 bad_ops = [{"insert": removed[0][0], "after": 9999}]  # anchor not in routes
@@ -195,16 +192,15 @@ _, _, skipped3b = _pdb_early.apply_insertions(fresh_partial.routes, dup_ops, req
 assert any("duplicate" in s for s in skipped3b), f"duplicate should be caught: {skipped3b}"
 print(f"  Duplicate insert: skipped={skipped3b} ✓")
 
-# Test D: score_coverage gives partial credit
-partial_sol = _pdb_early.PDPTWSolution(problem=problem, routes=fresh_partial.routes)
-cov_partial = _pdb_early.score_coverage(problem, partial_sol)
-assert 0 < cov_partial < 1.0, f"partial solution should have 0 < coverage < 1, got {cov_partial}"
-print(f"  score_coverage partial solution: {cov_partial:.3f} (expected <1.0 since 2 requests removed) ✓")
+# Test D: score_completion_t1 gives partial credit when only some pairs inserted
+partial_compl = _pdb_early.score_completion_t1(fresh_partial.routes, removed)
+assert partial_compl == 0.0, f"partial solution (no insertions) should have completion=0.0, got {partial_compl}"
+print(f"  score_completion_t1 before insertions: {partial_compl:.3f} (expected 0.0) ✓")
 
-# Test E: compute_score zeros on None solution
-none_components = _pdb_early.compute_score(problem, None, bks.total_distance)
-assert none_components == {"coverage": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0}
-print(f"  compute_score(None): {none_components} ✓")
+# Test E: compute_score with completion=0 and None solution
+none_components = _pdb_early.compute_score(problem, None, bks.total_distance, 0.0)
+assert none_components == {"completion": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0}
+print(f"  compute_score(None, completion=0): {none_components} ✓")
 print()
 
 # =============================================================================
@@ -227,13 +223,13 @@ print(f"Requests to serve with new route: {removed_requests}")
 fake_response = json.dumps({"new_route": removed_route, "reasoning": "test"})
 data = parse_json_response(fake_response)
 new_route = [int(n) for n in data.get("new_route", [])]
+compl_a = _pdb_early.score_completion_t2(new_route, removed_customers)
 full_routes = [r[:] for r in partial.routes] + [new_route]
 solution = build_solution_from_llm_output(problem, full_routes)
 if solution is not None:
-    feas = score_feasibility(problem, solution)
-    dist = score_distance_gap(solution.total_distance, bks.total_distance)
-    score = 0.5 * feas + 0.5 * dist
-    print(f"  Correct new route: feasible={feas==1.0}, dist_gap={dist:.3f}, score={score:.3f} ✓")
+    components_a = _pdb_early.compute_score(problem, solution, bks.total_distance, compl_a)
+    print(f"  Correct new route: compl={compl_a:.3f} feasible={components_a['feasibility']==1.0}, score={components_a['score']:.3f} ✓")
+    assert compl_a == 1.0, f"expected completion 1.0, got {compl_a}"
 else:
     print(f"  Correct new route: FAILED to build!")
 
@@ -242,11 +238,12 @@ wrong_route = [0] + list(reversed(removed_route[1:-1])) + [0]
 fake_response = json.dumps({"new_route": wrong_route, "reasoning": "test"})
 data = parse_json_response(fake_response)
 new_route = [int(n) for n in data.get("new_route", [])]
+compl_b = _pdb_early.score_completion_t2(new_route, removed_customers)
 full_routes = [r[:] for r in partial.routes] + [new_route]
 solution = build_solution_from_llm_output(problem, full_routes)
 if solution is not None:
-    feas = score_feasibility(problem, solution)
-    print(f"  Reversed new route: feasible={feas==1.0}")
+    components_b = _pdb_early.compute_score(problem, solution, bks.total_distance, compl_b)
+    print(f"  Reversed new route: compl={compl_b:.3f} feasible={components_b['feasibility']==1.0} score={components_b['score']:.3f}")
 else:
     print(f"  Reversed new route: build failed")
 print()
@@ -262,12 +259,12 @@ print("=" * 60)
 fake_response = json.dumps({"routes": bks.routes, "reasoning": "test"})
 data = parse_json_response(fake_response)
 routes_raw = data.get("routes", None)
+compl_t3 = _pdb_early.score_completion_t3(routes_raw or [], problem.pickups_deliveries)
 solution = build_solution_from_llm_output(problem, routes_raw)
 if solution is not None:
-    feas = score_feasibility(problem, solution)
-    dist = score_distance_gap(solution.total_distance, bks.total_distance)
-    score = 0.5 * feas + 0.5 * dist
-    print(f"  BKS routes: feasible={feas==1.0}, dist_gap={dist:.3f}, score={score:.3f} ✓")
+    components_t3 = _pdb_early.compute_score(problem, solution, bks.total_distance, compl_t3)
+    print(f"  BKS routes: compl={compl_t3:.3f} feasible={components_t3['feasibility']==1.0}, score={components_t3['score']:.3f} ✓")
+    assert compl_t3 == 1.0, f"expected completion 1.0 for BKS routes, got {compl_t3}"
 else:
     print(f"  BKS routes: FAILED!")
 
@@ -313,7 +310,7 @@ print("=" * 60)
 print("TEST: Iterative & Tool-use Drivers")
 print("=" * 60)
 
-import pdpbench as pdb
+import pdpbench_lib as pdb
 
 
 class FakeLLM:
@@ -388,9 +385,9 @@ assert abort is None, f"expected no abort, got {abort}"
 assert turns == 2, f"expected 2 turns, got {turns}"
 sol = pdb.build_solution_from_llm_output(problem, final_state)
 assert sol is not None, "iterative final solution should build"
-cov_iter = pdb.score_coverage(problem, sol)
-assert cov_iter == 1.0, f"iterative coverage should be 1.0, got {cov_iter}"
-print(f"  Iter success: turns={turns} coverage={cov_iter:.3f} dist={sol.total_distance:.1f} ✓")
+compl_iter = pdb.score_completion_t1(final_state, removed_reqs)
+assert compl_iter == 1.0, f"iterative completion should be 1.0, got {compl_iter}"
+print(f"  Iter success: turns={turns} completion={compl_iter:.3f} dist={sol.total_distance:.1f} ✓")
 
 # Verify each prompt carried history after turn 1
 assert "Prior turns" in fake.prompts[1], "turn 2 prompt should include history"

@@ -58,7 +58,7 @@ if HAS_KBENCH:
     print(f"\n{'='*60}")
     print(f"  MODEL: {_model_name}")
     print(f"  INSTANCES: {len(INSTANCES)} ({', '.join(p.name for p, _ in INSTANCES)})")
-    print(f"  SCORE: 0.4 * coverage + 0.3 * feasibility + 0.3 * distance_gap")
+    print(f"  SCORE: (1/3) * completion + (1/3) * feasibility + (1/3) * distance_gap")
     print(f"{'='*60}")
 
 # %%
@@ -145,20 +145,23 @@ if HAS_KBENCH:
                 d = {"instance": problem.name, "bks_dist": round(bks.total_distance, 1),
                      "turns": turns_used, "max_turns": max_turns, "unserved": len(unserved)}
 
+                completion = score_completion_t3(completed_routes, problem.pickups_deliveries)
+
                 if abort is not None:
-                    zero = {"coverage": 0.0, "feasibility": 0.0, "distance_gap": 0.0, "score": 0.0}
-                    scores.append(0.0)
+                    zero_score = completion / 3.0
+                    zero = {"completion": round(completion, 3), "feasibility": 0.0, "distance_gap": 0.0, "score": round(zero_score, 3)}
+                    scores.append(zero_score)
                     details.append({**d, "result": "ABORT", "abort": abort, **zero})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} unserved={len(unserved)} | ABORT({abort}) | score=0.0")
+                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} unserved={len(unserved)} | ABORT({abort}) | compl={completion:.2f} | score={zero_score:.3f}")
                     continue
 
                 solution = build_solution_from_llm_output(problem, completed_routes)
-                components = compute_score(problem, solution, bks.total_distance)
+                components = compute_score(problem, solution, bks.total_distance, completion)
                 score = components["score"]
                 if solution is None:
-                    scores.append(0.0)
+                    scores.append(score)
                     details.append({**d, "result": "BUILD_FAIL", **{k: round(v, 3) for k, v in components.items()}})
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} | BUILD_FAIL | score=0.0")
+                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} | BUILD_FAIL | compl={completion:.2f} | score={score:.3f}")
                     continue
 
                 d["llm_dist"] = round(solution.total_distance, 1)
@@ -167,10 +170,10 @@ if HAS_KBENCH:
                 if result == "INFEASIBLE":
                     d["violations"] = count_violations(problem, solution)
                     details.append(d)
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} | INFEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} | violations: {format_violations(d['violations'])} | score={score:.3f}")
+                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} | INFEASIBLE | compl={completion:.2f} llm_dist={solution.total_distance:.1f} | violations: {format_violations(d['violations'])} | score={score:.3f}")
                 else:
                     details.append(d)
-                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} | FEASIBLE | cov={components['coverage']:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} | score={score:.3f}")
+                    print(f"  [{TASK_ID} {i+1}/{len(INSTANCES)}] {problem.name} | turns={turns_used}/{max_turns} | FEASIBLE | compl={completion:.2f} llm_dist={solution.total_distance:.1f} bks={bks.total_distance:.1f} gap={components['distance_gap']:.3f} | score={score:.3f}")
                 scores.append(score)
 
             except Exception as _e:
