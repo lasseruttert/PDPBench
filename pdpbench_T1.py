@@ -94,7 +94,7 @@ if HAS_KBENCH:
                     parse_note = f"PARSE_FAIL(not_dict:{type(data).__name__})"
                     insertions = None
                 elif not isinstance(data.get("insertions"), list):
-                    keys = list(data.keys())[:5]
+                    keys = list(data.keys())[:5] if isinstance(data, dict) else []
                     parse_note = f"PARSE_FAIL(no_insertions_key,got_keys={keys})"
                     insertions = None
                 else:

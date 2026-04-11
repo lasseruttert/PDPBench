@@ -314,6 +314,8 @@ def score_completion_t1(routes, removed_pairs):
         return 0.0
     positions = {}
     for r_idx, route in enumerate(routes):
+        if not isinstance(route, (list, tuple)):
+            continue
         for p_idx, node in enumerate(route):
             if node == 0:
                 continue
@@ -338,6 +340,8 @@ def score_completion_t2(new_route, required_nodes):
     """T2/T5: fraction of required customer nodes present in the new route."""
     if not new_route or not required_nodes:
         return 0.0
+    if not isinstance(new_route, (list, tuple)):
+        return 0.0
     present = set(n for n in new_route if n != 0)
     return len(present & required_nodes) / len(required_nodes)
 
@@ -348,6 +352,8 @@ def score_completion_t3(routes, pickups_deliveries):
         return 0.0
     present = set()
     for route in routes:
+        if not isinstance(route, (list, tuple)):
+            continue
         for node in route:
             if node != 0:
                 present.add(node)
