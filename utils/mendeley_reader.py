@@ -79,6 +79,3 @@ def mendeley_reader(file_path):
 
     return problem
 
-if __name__ == "__main__":
-    problem = mendeley_reader('G:/Meine Ablage/rl-memetic-pdptw/data/n100/bar-n100-1.txt')
-    print(problem)

@@ -383,12 +383,25 @@ def compute_score(problem, solution, bks_distance, completion):
 def llm_prompt(llm, prompt, retries=4, delay=30):
     """Call llm.prompt with retry on transient errors (503, etc.).
 
+    Each call runs inside a fresh chats.new() context so conversation history
+    does not accumulate across instances (which would cause context-length errors).
+
     Backoff: 30s, 60s, 90s, 120s — the Kaggle model proxy needs minutes
     to recover from overload; aggressive sub-second sleep was futile.
     """
+    try:
+        from kaggle_benchmarks import chats as _kbchats
+        _fresh_chat = True
+    except ImportError:
+        _fresh_chat = False
+
     for attempt in range(retries):
         try:
-            return str(llm.prompt(prompt))
+            if _fresh_chat:
+                with _kbchats.new(orphan=True):
+                    return str(llm.prompt(prompt))
+            else:
+                return str(llm.prompt(prompt))
         except Exception as e:
             if attempt < retries - 1 and ("503" in str(e) or "could not reach" in str(e).lower()):
                 print(f"    Retry {attempt+1}/{retries} after error: {e}")

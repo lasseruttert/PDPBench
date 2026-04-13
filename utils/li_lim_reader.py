@@ -39,8 +39,3 @@ def li_lim_reader(file_path):
 
     return problem
 
-if __name__ == "__main__":
-    problem = li_lim_reader('G:/Meine Ablage/rl-memetic-pdptw/data/pdp_100/lc101.txt')
-    data = problem.data
-    problem.num_vehicles
-    # print(data)

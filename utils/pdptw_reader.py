@@ -26,13 +26,3 @@ def pdptw_reader(file_path):
         # Li & Lim format detected
         return li_lim_reader(file_path)
 
-if __name__ == "__main__":
-    # Test with Li & Lim format
-    print("Testing Li & Lim format:")
-    problem1 = pdptw_reader('G:/Meine Ablage/rl-memetic-pdptw/data/pdp_100/lc101.txt')
-    print(f"Loaded {problem1.num_requests} requests, {problem1.num_vehicles} vehicles\n")
-
-    # Test with Mendeley format
-    print("Testing Mendeley format:")
-    problem2 = pdptw_reader('G:/Meine Ablage/rl-memetic-pdptw/data/n100/bar-n100-1.txt')
-    print(f"Loaded {problem2.num_requests} requests, {problem2.num_vehicles} vehicles")
